@@ -19,6 +19,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 from datetime import datetime
+from io import BytesIO
 
 # -- Config --
 st.set_page_config(
@@ -28,42 +29,48 @@ st.set_page_config(
 )
 
 DATA_FILE = "data/analysis_results.csv"
+WHY_THIS_MATTERS = "Sustained abnormal behavior increases the risk of unplanned downtime, so early inspection is recommended."
+REQUIRED_COLUMNS = [
+    "timestamp",
+    "machine_id",
+    "voltage",
+    "vibration",
+    "pressure",
+    "rotation",
+    "health_score",
+    "status",
+]
+NUMERIC_COLUMNS = ["voltage", "vibration", "pressure", "rotation", "health_score"]
 
 # -- Helpers --
 @st.cache_data
-def load_data():
-    df = pd.read_csv(DATA_FILE, parse_dates=["timestamp"])
+def load_demo_data():
+    df = pd.read_csv(DATA_FILE)
+    return prepare_data(df)
+
+@st.cache_data
+def load_uploaded_data(file_bytes):
+    df = pd.read_csv(BytesIO(file_bytes))
+    return prepare_data(df)
+
+def prepare_data(df):
+    missing_columns = [column for column in REQUIRED_COLUMNS if column not in df.columns]
+    if missing_columns:
+        raise ValueError(f"Missing required column(s): {', '.join(missing_columns)}")
+
+    df = df.copy()
+    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+    if df["timestamp"].isna().any():
+        raise ValueError("The timestamp column contains values that could not be parsed.")
+
+    for column in NUMERIC_COLUMNS:
+        df[column] = pd.to_numeric(df[column], errors="coerce")
+        if df[column].isna().any():
+            raise ValueError(f"The {column} column contains non-numeric values.")
+
     return df
 
-def status_color(status):
-    return {
-        "HEALTHY": "🟢",
-        "WARNING": "🟡",
-        "CRITICAL": "🔴",
-    }.get(status, "⚪")
-
-# -- Load data --
-try:
-    df = load_data()
-except FileNotFoundError:
-    st.error("❌ Data file not found. Run `python generate_data.py` then `python analyze.py` first.")
-    st.stop()
-
-# -- Header --
-st.title("⚙️ Predictive Maintenance Dashboard")
-st.markdown("**SEP Project — AI analytics layer for factory SCADA data**")
-st.caption(f"Showing {len(df):,} readings across {df['machine_id'].nunique()} machines | Period: {df['timestamp'].min().strftime('%Y-%m-%d')} to {df['timestamp'].max().strftime('%Y-%m-%d')}")
-
-# -- Overview tab + per-machine tab --
-tab_overview, tab_machine, tab_alerts, tab_about = st.tabs(["📊 Overview", "🔧 Per Machine", "🚨 Alerts", "ℹ️ About"])
-
-# ============================================================
-# TAB 1: OVERVIEW
-# ============================================================
-with tab_overview:
-    st.subheader("Fleet Health at a Glance")
-
-    # Compute per-machine summary
+def build_fleet_summary(df):
     summary = df.groupby("machine_id").agg(
         avg_health=("health_score", "mean"),
         critical_count=("status", lambda x: (x == "CRITICAL").sum()),
@@ -74,6 +81,103 @@ with tab_overview:
     summary["overall_status"] = summary["critical_count"].apply(
         lambda x: "CRITICAL" if x > 40 else ("WARNING" if x > 15 else "HEALTHY")
     )
+    return summary
+
+def first_warning_sign(df, machine_id):
+    machine_df = df[df["machine_id"] == machine_id].sort_values("timestamp")
+    warning_rows = machine_df[machine_df["status"].isin(["WARNING", "CRITICAL"])]
+    if warning_rows.empty:
+        return "No warning signs detected."
+    first_warning = warning_rows.iloc[0]
+    return (
+        f"{first_warning['timestamp'].strftime('%Y-%m-%d %H:%M')} "
+        f"({first_warning['status']}, health score {first_warning['health_score']:.1f}/100)"
+    )
+
+def recommendation_for(status):
+    if status == "CRITICAL":
+        return "Inspect this machine immediately and plan maintenance before the next production window."
+    if status == "WARNING":
+        return "Schedule an inspection and monitor the next readings closely."
+    return "Continue routine monitoring."
+
+def status_color(status):
+    return {
+        "HEALTHY": "🟢",
+        "WARNING": "🟡",
+        "CRITICAL": "🔴",
+    }.get(status, "⚪")
+
+# -- Data source --
+if "upload_widget_key" not in st.session_state:
+    st.session_state.upload_widget_key = 0
+
+st.sidebar.header("Data Source")
+uploaded_file = st.sidebar.file_uploader(
+    "Upload CSV",
+    type=["csv"],
+    key=f"csv_upload_{st.session_state.upload_widget_key}",
+)
+if st.sidebar.button("Reset to Demo CSV"):
+    st.session_state.upload_widget_key += 1
+    st.rerun()
+
+# -- Load data --
+try:
+    if uploaded_file is not None:
+        df = load_uploaded_data(uploaded_file.getvalue())
+        data_source = "Uploaded CSV"
+    else:
+        df = load_demo_data()
+        data_source = "Demo CSV"
+except FileNotFoundError:
+    st.error("❌ Data file not found. Run `python generate_data.py` then `python analyze.py` first.")
+    st.stop()
+except (ValueError, pd.errors.EmptyDataError) as exc:
+    st.error(f"❌ CSV could not be loaded. {exc}")
+    st.stop()
+
+st.sidebar.caption(f"Data source: {data_source}")
+summary = build_fleet_summary(df)
+
+st.markdown(
+    """
+    <style>
+    div[data-testid="stMetric"] label,
+    div[data-testid="stMetric"] label p,
+    div[data-testid="stMetricLabel"],
+    div[data-testid="stMetricLabel"] p,
+    div[data-testid="stMetricValue"],
+    div[data-testid="stMetricValue"] div {
+        color: var(--text-color) !important;
+        opacity: 1 !important;
+    }
+
+    div[data-testid="stMetric"] label p,
+    div[data-testid="stMetric"] label,
+    div[data-testid="stMetricLabel"],
+    div[data-testid="stMetricLabel"] p,
+    div[data-testid="stMetricValue"] {
+        font-weight: 700 !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+# -- Header --
+st.title("⚙️ Predictive Maintenance Dashboard")
+st.markdown("**SEP Project — AI analytics layer for factory SCADA data**")
+st.caption(f"Showing {len(df):,} readings across {df['machine_id'].nunique()} machines | Period: {df['timestamp'].min().strftime('%Y-%m-%d')} to {df['timestamp'].max().strftime('%Y-%m-%d')}")
+
+# -- Overview tab + per-machine tab --
+tab_overview, tab_priorities, tab_machine, tab_alerts, tab_about = st.tabs(["📊 Overview", "Maintenance Priorities", "🔧 Per Machine", "🚨 Alerts", "ℹ️ About"])
+
+# ============================================================
+# TAB 1: OVERVIEW
+# ============================================================
+with tab_overview:
+    st.subheader("Fleet Health at a Glance")
 
     # KPI cards
     col1, col2, col3, col4 = st.columns(4)
@@ -105,7 +209,50 @@ with tab_overview:
     st.plotly_chart(fig, use_container_width=True)
 
 # ============================================================
-# TAB 2: PER-MACHINE DEEP DIVE
+# TAB 2: MAINTENANCE PRIORITIES
+# ============================================================
+with tab_priorities:
+    st.subheader("Fleet Risk Ranking")
+
+    ranking = summary.sort_values(
+        ["critical_count", "avg_health", "warning_count"],
+        ascending=[False, True, False],
+    ).reset_index(drop=True)
+    ranking_display = pd.DataFrame({
+        "Rank": range(1, len(ranking) + 1),
+        "Machine": ranking["machine_id"],
+        "Critical anomalies": ranking["critical_count"].astype(int),
+        "Average health score": ranking["avg_health"].map(lambda value: f"{value:.1f}/100"),
+        "Status": ranking["overall_status"].map(lambda value: f"{status_color(value)} {value}"),
+    })
+
+    st.dataframe(
+        ranking_display,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.markdown("---")
+    st.subheader("Detailed Alerts")
+
+    risky_machines = ranking[ranking["overall_status"].isin(["WARNING", "CRITICAL"])]
+    if risky_machines.empty:
+        st.success("No machines need immediate attention.")
+    else:
+        for _, row in risky_machines.iterrows():
+            with st.container(border=True):
+                st.markdown(f"### {status_color(row['overall_status'])} {row['machine_id']}")
+                st.markdown(
+                    f"**What I'm seeing:** {int(row['critical_count'])} critical anomalies "
+                    f"and {int(row['warning_count'])} warnings, with an average health score "
+                    f"of {row['avg_health']:.1f}/100."
+                )
+                st.markdown(f"**First warning sign:** {first_warning_sign(df, row['machine_id'])}")
+                st.markdown(f"**My recommendation:** {recommendation_for(row['overall_status'])}")
+                st.markdown(f"**Why this matters:** {WHY_THIS_MATTERS}")
+
+# ============================================================
+# TAB 3: PER-MACHINE DEEP DIVE
 # ============================================================
 with tab_machine:
     selected = st.selectbox("Select a machine", sorted(df["machine_id"].unique()))
@@ -120,7 +267,7 @@ with tab_machine:
         st.error(f"⚠️ HIGH RISK — {n_critical} critical anomalies detected. Recommend immediate inspection.")
         first_anomaly = machine_df[machine_df["status"] == "CRITICAL"]["timestamp"].min()
         st.write(f"**First anomaly detected:** {first_anomaly}")
-        st.write(f"**Pattern:** Early warning signals appeared before catastrophic failure window. With continuous monitoring, maintenance could have been scheduled 3-6 days earlier — saving downtime.")
+        st.write(f"**Pattern:** {WHY_THIS_MATTERS}")
     elif n_critical > 15:
         st.warning(f"🟡 MODERATE RISK — {n_critical} anomalies + {n_warning} warnings. Schedule inspection.")
     else:
@@ -167,7 +314,7 @@ with tab_machine:
     st.plotly_chart(fig, use_container_width=True)
 
 # ============================================================
-# TAB 3: ALERTS LOG
+# TAB 4: ALERTS LOG
 # ============================================================
 with tab_alerts:
     st.subheader("All Critical Anomalies")
@@ -184,7 +331,7 @@ with tab_alerts:
         )
 
 # ============================================================
-# TAB 4: ABOUT
+# TAB 5: ABOUT
 # ============================================================
 with tab_about:
     st.markdown("""
